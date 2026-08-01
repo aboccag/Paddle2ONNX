@@ -35,7 +35,8 @@ namespace paddle2onnx {
 MapperHelper* MapperHelper::helper = nullptr;
 int32_t OnnxHelper::opset_version = 7;
 bool ModelExporter::IsOpsRegistered(const PaddlePirParser& pir_parser,
-                                    bool enable_experimental_op) {
+                                    bool enable_experimental_op,
+                                    std::vector<std::string>* out_unsupported) {
   OnnxHelper temp_helper;
   std::set<std::string> unsupported_ops;
   std::unordered_set<std::string> skip_set = {"pd_op.data",
@@ -53,6 +54,9 @@ bool ModelExporter::IsOpsRegistered(const PaddlePirParser& pir_parser,
     }
   }
   // TODO(wangmingkai02) : judge op whether is experimental op
+  if (out_unsupported != nullptr) {
+    out_unsupported->assign(unsupported_ops.begin(), unsupported_ops.end());
+  }
   if (unsupported_ops.size() != 0) {
     P2OLogger() << "Unsupported tensor operators were found:";
     for (auto& item : unsupported_ops) {
@@ -95,7 +99,8 @@ bool ModelExporter::IsWhileSupported(const PaddleParser& parser,
 }
 
 bool ModelExporter::IsOpsRegistered(const PaddleParser& parser,
-                                    bool enable_experimental_op) {
+                                    bool enable_experimental_op,
+                                    std::vector<std::string>* out_unsupported) {
   OnnxHelper temp_helper;
   std::set<std::string> unsupported_ops;
   for (auto i = 0; i < parser.NumOfBlocks(); ++i) {
@@ -127,6 +132,9 @@ bool ModelExporter::IsOpsRegistered(const PaddleParser& parser,
         delete mapper;
       }
     }
+  }
+  if (out_unsupported != nullptr) {
+    out_unsupported->assign(unsupported_ops.begin(), unsupported_ops.end());
   }
   if (unsupported_ops.size() == 0) {
     return true;
@@ -1038,8 +1046,23 @@ std::string ModelExporter::Run(const PaddlePirParser& pir_parser,
   deploy_backend_ = deploy_backend;
   calibration_cache_ = calibration_cache;
   MapperHelper::Get()->ClearNameCounter();
-  Assert(IsOpsRegistered(pir_parser, enable_experimental_op),
-         "Due to the unsupported operators, the conversion is aborted.");
+  std::vector<std::string> unsupported_ops;
+  if (!IsOpsRegistered(pir_parser, enable_experimental_op, &unsupported_ops)) {
+    // Report by name and fail cleanly. Callers (converter.cc / the pybind
+    // layer) already treat an empty result as a conversion failure, so there
+    // is no need to abort the whole process.
+    std::string names;
+    for (size_t i = 0; i < unsupported_ops.size(); ++i) {
+      if (i) names += ", ";
+      names += unsupported_ops[i];
+    }
+    fprintf(stderr,
+            "[ERROR][Paddle2ONNX] Due to the unsupported operators, the "
+            "conversion is aborted. Unsupported operators (%zu): %s\n",
+            unsupported_ops.size(),
+            names.c_str());
+    return "";
+  }
   // Set ONNX Opset Version
   opset_version_ = opset_version;
   SetOpsetVersion(pir_parser, auto_upgrade_opset);
@@ -1095,9 +1118,19 @@ std::string ModelExporter::Run(const PaddleParser& parser,
   // while converting all the op
   MapperHelper::Get()->ClearNameCounter();
 
-  if (!IsOpsRegistered(parser, enable_experimental_op)) {
-    Assert(false,
-           "Due to the unsupported operators, the conversion is aborted.");
+  std::vector<std::string> unsupported_ops;
+  if (!IsOpsRegistered(parser, enable_experimental_op, &unsupported_ops)) {
+    std::string names;
+    for (size_t i = 0; i < unsupported_ops.size(); ++i) {
+      if (i) names += ", ";
+      names += unsupported_ops[i];
+    }
+    fprintf(stderr,
+            "[ERROR][Paddle2ONNX] Due to the unsupported operators, the "
+            "conversion is aborted. Unsupported operators (%zu): %s\n",
+            unsupported_ops.size(),
+            names.c_str());
+    return "";
   }
 
   // Set ONNX Opset Version

@@ -246,6 +246,7 @@ def export(
     except Exception as error:
         logging.error(f"Failed to convert PaddlePaddle model: {error}.")
         logging.error(traceback.print_exc())
+        raise
     finally:
         if (
             os.environ.get("P2O_KEEP_TEMP_MODEL", "0").lower()
@@ -262,6 +263,15 @@ def export(
             )
             shutil.rmtree(PADDLE2ONNX_EXPORT_TEMP_DIR, ignore_errors=True)
             PADDLE2ONNX_EXPORT_TEMP_DIR = None
+
+    # An empty result means the C++ exporter refused the model (e.g. unsupported
+    # operators). Writing it out would leave a 0-byte "model.onnx" behind and
+    # report success, so fail loudly instead.
+    if not onnx_model_str:
+        raise RuntimeError(
+            "Paddle2ONNX conversion failed: the exporter returned an empty "
+            "model. See the [ERROR][Paddle2ONNX] message above for the cause."
+        )
 
     if save_file is not None:
         # if optimize_tool == "onnxsim":

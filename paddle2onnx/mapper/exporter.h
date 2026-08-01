@@ -150,9 +150,15 @@ class ModelExporter {
   void ExportWhile(const PaddlePirParser& pir_parser,
                    OnnxHelper* temp_helper,
                    pir::Operation* op);
-  bool IsOpsRegistered(const PaddleParser& parser, bool enable_experimental_op);
+  // `unsupported_ops`, when non-null, receives the sorted names of the
+  // operators that have no registered mapper, so callers can report them
+  // instead of failing with an anonymous error.
+  bool IsOpsRegistered(const PaddleParser& parser,
+                       bool enable_experimental_op,
+                       std::vector<std::string>* unsupported_ops = nullptr);
   bool IsOpsRegistered(const PaddlePirParser& parser,
-                       bool enable_experimental_op);
+                       bool enable_experimental_op,
+                       std::vector<std::string>* unsupported_ops = nullptr);
 
   ONNX_NAMESPACE::ModelProto onnx_model_;
   // Opset Version
