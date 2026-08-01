@@ -95,8 +95,15 @@ void GatherMapper::Opset11() {
   }
   // If index.shape = [d_0, 1], squeeze the last dim to reshape index.shape =
   // [d_0].
+  //
+  // Paddle's gather flattens a [d, 1] index for *every* axis, so this must not
+  // be conditioned on the axis. ONNX Gather instead keeps the index rank, which
+  // makes the output rank one higher than Paddle's: gathering a rank-4 NCHW
+  // tensor on axis 0 with a [d, 1] index produced a rank-5 result and the
+  // following Conv then failed to load with
+  // "[ShapeInferenceError] Attribute dilations has incorrect size".
   std::string index_name = index_info[0].name;
-  if (index_info[0].shape.size() == 2 && axis > 0) {
+  if (index_info[0].shape.size() == 2) {
     index_name = helper_->Squeeze(index_info[0].name, {1});
   }
   // Normal
