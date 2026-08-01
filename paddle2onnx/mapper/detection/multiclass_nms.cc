@@ -22,6 +22,25 @@ REGISTER_PIR_MAPPER(multiclass_nms3, NMSMapper);
 int32_t NMSMapper::GetMinOpsetVersion(bool verbose) {
   auto boxes_info = GetInput("BBoxes");
   auto score_info = GetInput("Scores");
+  if (score_info[0].Rank() == 2) {
+    // LoD form, emitted by the RCNN family: BBoxes [M, C, 4], Scores [M, C].
+    // Handled by ExportForLodInput(), which needs NonZero (opset 9) and
+    // NonMaxSuppression (opset 10).
+    if (boxes_info[0].Rank() != 3) {
+      Error() << "For LoD input, boxes are expected to be a 3-D tensor of "
+                 "shape [M, C, 4], but the rank is "
+              << boxes_info[0].Rank() << "." << std::endl;
+      return -1;
+    }
+    if (score_info[0].shape[1] <= 0) {
+      Error() << "The number of classes (2nd dimension of scores) must be "
+                 "static, but it is "
+              << score_info[0].shape[1] << "." << std::endl;
+      return -1;
+    }
+    Logger(verbose, 10) << RequireOpset(10) << std::endl;
+    return 10;
+  }
   if (score_info[0].Rank() != 3) {
     Error() << "Lod Tensor input is not supported, which means the shape of "
                "input(scores) is [M, C] now, but Paddle2ONNX only support [N, "
@@ -223,12 +242,191 @@ void NMSMapper::KeepTopK(const std::string& selected_indices) {
                                                  num_rois_info[0].dtype);
 }
 
+// Two-stage detectors run NMS over per-class boxes: BBoxes is [M, C, 4] and
+// Scores is [M, C], with no batch dimension (batch size is 1 by construction).
+//
+// ONNX NonMaxSuppression takes boxes shared across classes, [B, M, 4], so the
+// per-class boxes are folded into the *batch* axis instead: transposing to
+// [C, M, 4] with scores [C, 1, M] makes ONNX run one independent single-class
+// NMS per class, which is exactly Paddle's semantics. The returned "batch"
+// index is then the class id.
+void NMSMapper::ExportForLodInput() {
+  auto boxes_info = GetInput("BBoxes");   // [M, C, 4]
+  auto score_info = GetInput("Scores");   // [M, C]
+  auto out_info = GetOutput("Out");
+  auto index_info = GetOutput("Index");
+  auto num_rois_info = GetOutput("NmsRoisNum");
+
+  const int64_t num_classes = score_info[0].shape[1];
+  auto i64 = [&](int64_t v) {
+    return helper_->Constant(
+        {1}, ONNX_NAMESPACE::TensorProto::INT64, v);
+  };
+
+  auto boxes_by_class = helper_->Transpose(boxes_info[0].name, {1, 0, 2});
+  if (!normalized_) {
+    // Paddle measures IoU on inclusive pixel coordinates when the boxes are
+    // not normalised; widen xmax/ymax by one to match.
+    auto one = helper_->Constant(
+        {1}, GetOnnxDtype(boxes_info[0].dtype), static_cast<float>(1.0));
+    auto parts =
+        helper_->Split(boxes_by_class, std::vector<int64_t>(4, 1), 2);
+    auto xmax = helper_->MakeNode("Add", {parts[2], one})->output(0);
+    auto ymax = helper_->MakeNode("Add", {parts[3], one})->output(0);
+    auto widened =
+        helper_->MakeNode("Concat", {parts[0], parts[1], xmax, ymax});
+    AddAttribute(widened, "axis", int64_t(2));
+    boxes_by_class = widened->output(0);
+  }
+  // [M, C] -> [C, M] -> [C, 1, M]
+  auto scores_by_class =
+      helper_->Unsqueeze(helper_->Transpose(score_info[0].name, {1, 0}), {1});
+
+  // Paddle spells "no per-class limit" as nms_top_k <= 0, but ONNX reads a
+  // non-positive max_output_boxes_per_class as "select nothing" — so fall back
+  // to the actual box count instead of passing the negative value through.
+  auto num_boxes = helper_->Slice(
+      helper_->MakeNode("Shape", {boxes_by_class})->output(0), {0}, {1}, {2});
+  auto max_per_class = nms_top_k_ > 0 ? i64(nms_top_k_) : num_boxes;
+
+  auto selected =
+      helper_->MakeNode("NonMaxSuppression",
+                        {boxes_by_class,
+                         scores_by_class,
+                         max_per_class,
+                         helper_->Constant({1},
+                                           ONNX_NAMESPACE::TensorProto::FLOAT,
+                                           nms_threshold_),
+                         helper_->Constant({1},
+                                           ONNX_NAMESPACE::TensorProto::FLOAT,
+                                           score_threshold_)})
+          ->output(0);  // [K, 3] as (class, 0, box)
+
+  auto gather_col = [&](const std::string& data, int64_t col) {
+    auto n = helper_->MakeNode("Gather", {data, i64(col)});
+    AddAttribute(n, "axis", int64_t(1));
+    return n->output(0);  // [K, 1]
+  };
+  auto class_id = gather_col(selected, 0);
+  auto box_id = gather_col(selected, 2);
+
+  // ── Drop the background class ────────────────────────────────────────────
+  if (background_label_ >= 0) {
+    auto squeezed = helper_->Squeeze(class_id, {1});
+    std::string keep;
+    if (background_label_ == 0) {
+      keep = helper_->MakeNode("NonZero", {squeezed})->output(0);
+    } else {
+      auto diff =
+          helper_->MakeNode("Sub", {squeezed, i64(background_label_)})
+              ->output(0);
+      keep = helper_->MakeNode("NonZero", {diff})->output(0);
+    }
+    auto keep_1d = helper_->Reshape(keep, {-1});
+    auto take = [&](const std::string& d) {
+      auto n = helper_->MakeNode("Gather", {d, keep_1d});
+      AddAttribute(n, "axis", int64_t(0));
+      return n->output(0);
+    };
+    class_id = take(class_id);
+    box_id = take(box_id);
+  }
+
+  // ── Scores and boxes of the survivors ────────────────────────────────────
+  // Both Scores [M, C] and BBoxes [M, C, 4] are indexed by (box, class), so a
+  // single flat index box_id * C + class_id serves for both.
+  auto flat_index = helper_->Reshape(
+      helper_->MakeNode(
+                  "Add",
+                  {helper_->MakeNode("Mul", {box_id, i64(num_classes)})
+                       ->output(0),
+                   class_id})
+          ->output(0),
+      {-1});
+  auto flat_scores = helper_->Reshape(score_info[0].name, {-1});
+  auto gather0 = [&](const std::string& data, const std::string& idx) {
+    auto n = helper_->MakeNode("Gather", {data, idx});
+    AddAttribute(n, "axis", int64_t(0));
+    return n->output(0);
+  };
+  auto final_scores = gather0(flat_scores, flat_index);
+  auto flat_boxes = helper_->Reshape(boxes_info[0].name, {-1, 4});
+  auto final_boxes = gather0(flat_boxes, flat_index);
+  auto final_classes = helper_->Reshape(class_id, {-1});
+  auto final_box_ids = helper_->Reshape(box_id, {-1});
+
+  // ── keep_top_k over everything that survived ─────────────────────────────
+  auto flat_index_kept = flat_index;
+  if (keep_top_k_ > 0) {
+    auto num_left = helper_->Slice(
+        helper_->MakeNode("Shape", {final_scores})->output(0), {0}, {0}, {1});
+    auto k = helper_->MakeNode("Min", {num_left, i64(keep_top_k_)})->output(0);
+
+    auto topk = helper_->MakeNode("TopK", {final_scores, k}, 2);
+    AddAttribute(topk, "axis", int64_t(0));
+    AddAttribute(topk, "largest", int64_t(1));
+    AddAttribute(topk, "sorted", int64_t(1));
+    auto order = topk->output(1);
+    final_scores = topk->output(0);
+    final_boxes = gather0(final_boxes, order);
+    final_classes = gather0(final_classes, order);
+    final_box_ids = gather0(final_box_ids, order);
+    flat_index_kept = gather0(flat_index_kept, order);
+  }
+
+  // ── Match Paddle's output ordering: class ascending, box index ascending ──
+  // Sorting by the composite key class * M + box_id reproduces it in one pass.
+  {
+    auto key = helper_->MakeNode(
+                           "Add",
+                           {helper_->MakeNode("Mul", {final_classes, num_boxes})
+                                ->output(0),
+                            final_box_ids})
+                   ->output(0);
+    auto n_final = helper_->Slice(
+        helper_->MakeNode("Shape", {key})->output(0), {0}, {0}, {1});
+    auto ordered = helper_->MakeNode("TopK", {key, n_final}, 2);
+    AddAttribute(ordered, "axis", int64_t(0));
+    AddAttribute(ordered, "largest", int64_t(0));
+    AddAttribute(ordered, "sorted", int64_t(1));
+    auto o = ordered->output(1);
+    final_scores = gather0(final_scores, o);
+    final_boxes = gather0(final_boxes, o);
+    final_classes = gather0(final_classes, o);
+    flat_index_kept = gather0(flat_index_kept, o);
+  }
+
+  // ── Assemble Out as [num, 6] = (class, score, xmin, ymin, xmax, ymax) ────
+  auto class_f = helper_->MakeNode("Cast", {final_classes});
+  AddAttribute(class_f, "to", GetOnnxDtype(boxes_info[0].dtype));
+  auto out = helper_->MakeNode("Concat",
+                               {helper_->Reshape(class_f->output(0), {-1, 1}),
+                                helper_->Reshape(final_scores, {-1, 1}),
+                                final_boxes});
+  AddAttribute(out, "axis", int64_t(1));
+  helper_->MakeNode("Identity", {out->output(0)}, {out_info[0].name});
+
+  // Paddle's Index is the flattened (box, class) position, not the box id.
+  helper_->AutoCast(helper_->Reshape(flat_index_kept, {-1, 1}),
+                    index_info[0].name,
+                    P2ODataType::INT64,
+                    index_info[0].dtype);
+
+  auto num = helper_->Slice(
+      helper_->MakeNode("Shape", {out->output(0)})->output(0), {0}, {0}, {1});
+  helper_->AutoCast(
+      num, num_rois_info[0].name, P2ODataType::INT64, num_rois_info[0].dtype);
+}
+
 void NMSMapper::Opset10() {
   if (this->deploy_backend == "tensorrt") {
     return ExportForTensorRT();
   }
   auto boxes_info = GetInput("BBoxes");
   auto score_info = GetInput("Scores");
+  if (score_info[0].Rank() == 2) {
+    return ExportForLodInput();
+  }
   if (boxes_info[0].shape[0] != 1) {
     Warn() << "Due to the operator multiclass_nms3, the exported ONNX model "
               "will only supports inference with input batch_size == 1."

@@ -72,6 +72,9 @@ class NMSMapper : public Mapper {
   void KeepTopK(const std::string& selected_indices);
   void Opset10() override;
   void ExportForTensorRT();
+  // Handles the LoD form produced by two-stage detectors, where the boxes are
+  // per class: BBoxes is [M, C, 4] and Scores is [M, C].
+  void ExportForLodInput();
 
  private:
   bool normalized_;
