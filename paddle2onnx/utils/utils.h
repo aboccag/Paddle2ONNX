@@ -66,8 +66,19 @@ class P2OLogger {
     return *this;
   }
   ~P2OLogger() {
-    if (!verbose_ && line_ != "") {
-      std::cout << line_ << std::endl;
+    // Flush anything that was streamed in but never terminated with std::endl.
+    // Without this, code of the shape
+    //     P2OLogger() << "some text";     // separate temporary, dropped
+    //     P2OLogger() << std::endl;       // prints an empty line
+    // silently discards every message, because each statement builds its own
+    // temporary whose buffer dies with it. That is what made the
+    // "unsupported operators" report print an empty list.
+    if (line_ != "") {
+      if (verbose_) {
+        std::cout << prefix_ << " " << line_ << std::endl;
+      } else {
+        std::cout << line_ << std::endl;
+      }
     }
   }
 
