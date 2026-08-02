@@ -51,15 +51,13 @@ bool ModelExporter::IsOpsRegistered(const PaddlePirParser& pir_parser,
                                     std::vector<std::string>* out_unsupported) {
   OnnxHelper temp_helper;
   std::set<std::string> unsupported_ops;
-  std::unordered_set<std::string> skip_set = {"pd_op.data",
-                                              "pd_op.feed",
-                                              "pd_op.fetch",
-                                              "pd_op.if",
-                                              "pd_op.while",
-                                              "cf.yield",
-                                              "pd_op.print"};
+  // if/while are not dropped — they are exported by ExportBlock/ExportWhile
+  // rather than by a registered mapper.
+  std::unordered_set<std::string> handled_elsewhere = {"pd_op.if",
+                                                       "pd_op.while"};
   for (auto op : pir_parser.total_blocks_ops) {
-    if (skip_set.count(op->name())) continue;
+    if (IsSkippablePirOp(op->name()) || handled_elsewhere.count(op->name()))
+      continue;
     std::string op_name = convert_pir_op_name(op->name());
     if (!MapperHelper::Get()->IsRegisteredInPir(op_name, verbose_)) {
       unsupported_ops.insert(op_name);
@@ -245,9 +243,7 @@ int32_t ModelExporter::GetMinOpsetVersion(const PaddlePirParser& pir_parser,
   for (auto i = 0; i < block_ops.size(); ++i) {
     auto op = block_ops[i];
     std::string op_name = op->name();
-    if (op_name == "pd_op.data" || op_name == "pd_op.feed" ||
-        op_name == "pd_op.fetch" || op_name == "cf.yield" ||
-        op_name == "pd_op.print") {
+    if (IsSkippablePirOp(op_name)) {
       continue;
     }
     int current_opset = 7;
@@ -548,8 +544,7 @@ ONNX_NAMESPACE::GraphProto ModelExporter::ExportBlock(
   temp_helper.Clear();
   for (auto i = 0; i < num_ops; ++i) {
     auto op = block_ops[i];
-    if (op->name() == "pd_op.data" || op->name() == "pd_op.feed" ||
-        op->name() == "pd_op.fetch" || op->name() == "cf.yield") {
+    if (IsSkippablePirOp(op->name())) {
       continue;
     }
     if (op->name() == "pd_op.if") {
