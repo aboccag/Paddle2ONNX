@@ -26,6 +26,58 @@ import traceback
 PADDLE2ONNX_EXPORT_TEMP_DIR = None
 
 
+def _walk_graphs(graph):
+    """Yield a graph and every subgraph nested in its nodes' attributes."""
+    yield graph
+    for node in graph.node:
+        for attr in node.attribute:
+            if attr.HasField("g"):
+                for sub in _walk_graphs(attr.g):
+                    yield sub
+            for sub_graph in attr.graphs:
+                for sub in _walk_graphs(sub_graph):
+                    yield sub
+
+
+def _collect_value_info_names(graph):
+    """The intermediate tensors the exporter itself annotated with a shape.
+
+    Flattened over subgraphs on purpose: folding can delete nodes, so the
+    subgraphs of the folded model cannot be matched to those of the original
+    positionally. Tensor names are unique across the exported model, so one set
+    is enough.
+    """
+    return set(vi.name for g in _walk_graphs(graph) for vi in g.value_info)
+
+
+def _drop_inferred_value_info(graph, exporter_value_infos):
+    """Keep only the value_info the exporter produced, drop the folder's own.
+
+    Polygraphy annotates the folded graph with the results of its symbolic
+    shape inference. Those annotations are optional in ONNX -- every runtime
+    infers shapes for itself -- but onnxruntime trusts them when it plans which
+    buffers a node may reuse, so a *wrong* one is not a lost optimisation, it is
+    a crash at the first inference, long after the model has loaded cleanly.
+
+    The inference is wrong on the yolov3 head, where all three slices of the
+    prediction tensor (box / objectness / class scores) have a symbolic channel
+    dimension: the broadcasting Mul that follows makes the inference merge those
+    dimensions with each other and eventually with the constant 4 of the box
+    branch, so the class-score tensor is annotated [1, 3, 76, 76, 4] while it is
+    really [1, 3, 76, 76, 80]. ORT then plans to reuse the objectness buffer for
+    it and aborts.
+
+    The C++ exporter annotates only what it knows first-hand (graph inputs and
+    outputs, and the boundaries of while blocks), so dropping the rest costs
+    nothing and cannot contradict the graph.
+    """
+    for g in _walk_graphs(graph):
+        keep = [vi for vi in g.value_info if vi.name in exporter_value_infos]
+        if len(keep) != len(g.value_info):
+            del g.value_info[:]
+            g.value_info.extend(keep)
+
+
 def get_tmp_dir_and_file(model_filename, suffix=""):
     global PADDLE2ONNX_EXPORT_TEMP_DIR
     if PADDLE2ONNX_EXPORT_TEMP_DIR is None:
@@ -335,7 +387,9 @@ def export(
 
                 model_stream = io.BytesIO(onnx_model_str)
                 onnx_model = onnx.load_model(model_stream)
+                exporter_value_infos = _collect_value_info_names(onnx_model.graph)
                 folded_model = fold_constants(onnx_model)
+                _drop_inferred_value_info(folded_model.graph, exporter_value_infos)
                 onnx.checker.check_model(folded_model, full_check=True)
                 origin_rank_list = []
                 folded_rank_list = []
