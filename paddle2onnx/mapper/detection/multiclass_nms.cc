@@ -125,8 +125,21 @@ void NMSMapper::KeepTopK(const std::string& selected_indices) {
   // calculated as
   //    `gather_index = class_id * M + box_id`
   auto flatten_score = helper_->Flatten(score_info[0].name);
-  auto num_boxes_each_class = helper_->Constant(
-      {1}, ONNX_NAMESPACE::TensorProto::INT64, score_info[0].shape[2]);
+  // M (boxes per class) is only known statically for fixed-size graphs. SSD
+  // exports scores as [N, C, -1], and folding -1 into the flat gather index
+  // computed below silently produced scores read from the wrong offsets — the
+  // boxes were right, the scores were not. Fall back to the runtime shape.
+  std::string num_boxes_each_class;
+  if (score_info[0].shape[2] > 0) {
+    num_boxes_each_class = helper_->Constant(
+        {1}, ONNX_NAMESPACE::TensorProto::INT64, score_info[0].shape[2]);
+  } else {
+    num_boxes_each_class = helper_->Slice(
+        helper_->MakeNode("Shape", {score_info[0].name})->output(0),
+        {0},
+        {2},
+        {3});
+  }
   auto gather_indices_0 =
       helper_->MakeNode("Mul", {filtered_class_id, num_boxes_each_class});
   auto gather_indices_1 =
