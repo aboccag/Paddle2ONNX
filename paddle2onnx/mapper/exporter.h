@@ -34,6 +34,21 @@
 #define PATH_SEP "/"
 #endif
 
+// Operators that are dropped from the exported graph entirely: graph plumbing
+// (data/feed/fetch/yield) and debug-only side effects with no results
+// (print/assert). Kept in one place because the support check and the exporter
+// must agree — when they did not, an op could pass the check and then abort
+// during export, or vice versa.
+inline bool IsSkippablePirOp(const std::string& pir_op_name) {
+  static const std::unordered_set<std::string> skippable = {"pd_op.data",
+                                                            "pd_op.feed",
+                                                            "pd_op.fetch",
+                                                            "cf.yield",
+                                                            "pd_op.print",
+                                                            "pd_op.assert"};
+  return skippable.count(pir_op_name) > 0;
+}
+
 inline std::string convert_pir_op_name(const std::string pir_op_name) {
   std::unordered_map<std::string, std::string> op_name_mappings = {
       {"matmul", "matmul_v2"},
