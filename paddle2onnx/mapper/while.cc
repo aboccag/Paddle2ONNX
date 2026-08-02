@@ -15,6 +15,39 @@
 #include "paddle/fluid/pir/dialect/operator/ir/control_flow_op.h"
 #include "paddle2onnx/mapper/exporter.h"
 namespace paddle2onnx {
+namespace {
+// A sequence-typed graph input/output. MakeValueInfo only builds tensor types.
+std::shared_ptr<ONNX_NAMESPACE::ValueInfoProto> MakeSequenceValueInfo(
+    const std::string& name, int32_t paddle_dtype) {
+  auto value_info = std::make_shared<ONNX_NAMESPACE::ValueInfoProto>();
+  value_info->set_name(name);
+  value_info->mutable_type()
+      ->mutable_sequence_type()
+      ->mutable_elem_type()
+      ->mutable_tensor_type()
+      ->set_elem_type(GetOnnxDtype(paddle_dtype));
+  return value_info;
+}
+
+// A TensorArray that lives outside a while body but is written inside it.
+//
+// Paddle's array_write_ mutates a captured container in place, so the array is
+// neither an operand nor a result of the while op. ONNX sequences are
+// immutable SSA values, and while a subgraph may read names from the enclosing
+// graph it can never publish names back out — so the array has to be turned
+// into an explicit loop-carried variable: an extra Loop input, an extra body
+// input, an extra body output and an extra Loop output.
+struct CarriedArray {
+  pir::Operation* producer = nullptr;  // defines the array outside the loop
+  pir::Value value;
+  int32_t dtype = 0;
+  std::string outer_name;     // sequence name in the enclosing graph
+  std::string body_in_name;   // body graph input
+  std::string body_out_name;  // body graph output, known only after export
+  std::string loop_out_name;  // Loop node output
+};
+}  // namespace
+
 void ModelExporter::ExportWhile(const PaddlePirParser& pir_parser,
                                 OnnxHelper* temp_helper,
                                 pir::Operation* op) {
@@ -49,6 +82,28 @@ void ModelExporter::ExportWhile(const PaddlePirParser& pir_parser,
     if (op->name() != "builtin.parameter") {
       pir_parser.sub_blocks_ops.push_back(op);
     }
+  }
+
+  // Find the TensorArrays this loop mutates but does not own.
+  std::vector<CarriedArray> carried_arrays;
+  for (auto& body_op : body_block.ops()) {
+    if (body_op->name() != "pd_op.array_write_") continue;
+    if (body_op->num_operands() == 0) continue;
+    pir::Value arr = body_op->operand(0).source();
+    pir::Operation* producer = arr.defining_op();
+    if (producer == nullptr || producer->GetParent() == &body_block) continue;
+    if (!pir_parser.HasTensorArrayName(producer)) continue;
+    bool seen = false;
+    for (auto& ca : carried_arrays) {
+      if (ca.producer == producer) seen = true;
+    }
+    if (seen) continue;
+    CarriedArray ca;
+    ca.producer = producer;
+    ca.value = arr;
+    ca.dtype = pir_parser.GetTensorInfo(std::string(), arr.type()).dtype;
+    if (ca.dtype == P2ODataType::UNDEFINED) continue;
+    carried_arrays.push_back(ca);
   }
 
   // generate sub-block op outputs names in GetMinOpSetVersion() function.
@@ -106,9 +161,27 @@ void ModelExporter::ExportWhile(const PaddlePirParser& pir_parser,
   for (size_t i = 0; i < outputs_info.size(); ++i) {
     outputs.push_back(std::move(MakeValueInfo(outputs_info[i])));
   }
+  // Rebind each carried array to a fresh body input so that the array_write
+  // chain inside the body starts from the loop variable rather than from the
+  // enclosing graph's sequence.
+  for (auto& ca : carried_arrays) {
+    ca.outer_name = pir_parser.GetTensorArrayNameOf(ca.producer);
+    ca.body_in_name = MapperHelper::Get()->GenName("loop.seq");
+    inputs.push_back(MakeSequenceValueInfo(ca.body_in_name, ca.dtype));
+    pir_parser.SetTensorArrayNameOf(ca.producer, ca.body_in_name);
+  }
+
   pir::Block* blockPtr = &body_block;
   graph = ExportBlock(
       pir_parser, blockPtr, parameters, &inputs, &outputs, true, true);
+
+  // After exporting the body the mapping holds the last array_write output,
+  // which is what the body must yield.
+  for (auto& ca : carried_arrays) {
+    ca.body_out_name = pir_parser.GetTensorArrayNameOf(ca.producer);
+    *(graph.add_output()) =
+        *(MakeSequenceValueInfo(ca.body_out_name, ca.dtype).get());
+  }
   for (auto& item : extra_nodes) {
     *(graph.add_node()) = (*item.get());
   }
@@ -126,11 +199,23 @@ void ModelExporter::ExportWhile(const PaddlePirParser& pir_parser,
   for (size_t i = 0; i < inputs_info.size(); ++i) {
     input_names.push_back(inputs_info[i].name);
   }
+  for (auto& ca : carried_arrays) {
+    input_names.push_back(ca.outer_name);
+  }
   for (size_t i = 0; i < op->num_results(); i++) {
     output_names.push_back(pir_parser.GetSubBlockOpOutputName(op->result(i)));
   }
+  for (auto& ca : carried_arrays) {
+    ca.loop_out_name = MapperHelper::Get()->GenName("loop.seq.out");
+    output_names.push_back(ca.loop_out_name);
+  }
   auto loop_node = temp_helper->MakeNode("Loop", input_names, output_names);
   AddAttribute(loop_node, "body", graph);
+
+  // Reads after the loop must see the sequence the Loop produced.
+  for (auto& ca : carried_arrays) {
+    pir_parser.SetTensorArrayNameOf(ca.producer, ca.loop_out_name);
+  }
 }
 
 void ModelExporter::ExportWhile(const PaddleParser& parser,
