@@ -270,6 +270,19 @@ class PaddlePirParser {
                           bool if_in_sub_block,
                           std::string tensor_arr_name) const;
   std::string GetTensorArrayName(int64_t op_id, bool if_in_sub_block) const;
+  // Same mapping, addressed by the operation that produces the array rather
+  // than by the operation that consumes it. ExportWhile needs this to rebind an
+  // array's name while it descends into a loop body and again on the way out.
+  bool HasTensorArrayName(pir::Operation* producer) const {
+    return _tensor_arr_mappings.count(producer) > 0;
+  }
+  std::string GetTensorArrayNameOf(pir::Operation* producer) const {
+    return _tensor_arr_mappings.at(producer);
+  }
+  void SetTensorArrayNameOf(pir::Operation* producer,
+                            const std::string& name) const {
+    _tensor_arr_mappings[producer] = name;
+  }
   std::string GenOpInputOutputName(const std::string& name) const;
   void GetWhileInputValuesAndArgsMappings(
       paddle::dialect::WhileOp* while_op) const;
