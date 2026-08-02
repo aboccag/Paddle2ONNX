@@ -18,7 +18,18 @@ namespace paddle2onnx {
 REGISTER_MAPPER(roi_align, RoiAlignMapper)
 REGISTER_PIR_MAPPER(roi_align, RoiAlignMapper)
 
-void RoiAlignMapper::Opset10() {
+void RoiAlignMapper::Opset10() { Export(false); }
+
+// From opset 16 the operator gained coordinate_transformation_mode, whose
+// default (half_pixel) differs from the behaviour of RoiAlign-10. Paddle's
+// `aligned` attribute picks between the two, and until now it was parsed and
+// then dropped — so a graph that got auto-upgraded to opset 16 for an unrelated
+// reason silently changed how every RoI was sampled. Mask R-CNN is exactly that
+// case: its mask head needs GridSample (opset 16), which bumped the whole graph
+// and shifted the *box* branch by half a pixel.
+void RoiAlignMapper::Opset16() { Export(true); }
+
+void RoiAlignMapper::Export(bool emit_coordinate_transformation_mode) {
   auto x_info = GetInput("X");
   auto rois_info = GetInput("ROIs");
   auto out_info = GetOutput("Out");
@@ -43,6 +54,11 @@ void RoiAlignMapper::Opset10() {
   AddAttribute(roi_align_node, "sampling_ratio", sampling_ratio_);
   AddAttribute(roi_align_node, "spatial_scale", spatial_scale_);
   AddAttribute(roi_align_node, "mode", "avg");
+  if (emit_coordinate_transformation_mode) {
+    AddAttribute(roi_align_node,
+                 "coordinate_transformation_mode",
+                 aligned_ ? "half_pixel" : "output_half_pixel");
+  }
 }
 
 }  // namespace paddle2onnx

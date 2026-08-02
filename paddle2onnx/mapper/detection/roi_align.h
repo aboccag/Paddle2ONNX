@@ -50,6 +50,13 @@ class RoiAlignMapper : public Mapper {
     return 10;
   }
   void Opset10() override;
+  // RoiAlign-16 introduced coordinate_transformation_mode and defaults it to
+  // half_pixel, which is NOT what RoiAlign-10 did. Paddle's `aligned` flag
+  // selects between the two, so from opset 16 on it must be emitted.
+  void Opset16() override;
+
+ private:
+  void Export(bool emit_coordinate_transformation_mode);
 
  private:
   int64_t pooled_height_;
