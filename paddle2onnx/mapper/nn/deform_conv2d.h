@@ -49,7 +49,11 @@ class DeformConv2dMapper : public Mapper {
   }
 
   int32_t GetMinOpsetVersion(bool verbose) override;
-  void Opset19() override;
+  // ONNX has a DeformConv operator since opset 19, but ONNX Runtime ships no
+  // kernel for it, so a model using it converts and then cannot be loaded.
+  // Opset16 decomposes the op into GridSample + im2col + MatMul instead, which
+  // every runtime can execute.
+  void Opset16() override;
 
  private:
   std::vector<int64_t> strides_;
