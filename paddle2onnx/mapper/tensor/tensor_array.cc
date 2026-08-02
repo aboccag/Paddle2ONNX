@@ -23,6 +23,7 @@ REGISTER_PIR_MAPPER(create_array, CreateArrayMapper)
 REGISTER_PIR_MAPPER(array_length, ArrayLengthMapper)
 REGISTER_PIR_MAPPER(array_write_, ArrayWriteMapper)
 REGISTER_PIR_MAPPER(array_read, ArrayReadMapper)
+REGISTER_PIR_MAPPER(slice_array_dense, SliceArrayDenseMapper)
 
 int32_t CreateArrayMapper::GetMinOpsetVersion(bool verbose) {
   Logger(verbose, 11) << "CreateArrayMapper " << RequireOpset(11) << std::endl;
@@ -70,6 +71,26 @@ void ArrayReadMapper::Opset11() {
   std::string arr_name = GetTensorArrayName();
   helper_->MakeNode(
       "SequenceAt", {arr_name, squeeze_node->output(0)}, {output_info[0].name});
+}
+
+int32_t SliceArrayDenseMapper::GetMinOpsetVersion(bool verbose) {
+  Logger(verbose, 11) << "SliceArrayDenseMapper " << RequireOpset(11)
+                      << std::endl;
+  return 11;
+}
+
+void SliceArrayDenseMapper::Opset11() {
+  // phi's SliceArrayDenseKernel is `out = input[starts[0]]`, with a negative
+  // index wrapped by adding the array length and then clamped at 0. ONNX
+  // SequenceAt already counts a negative position from the back, so the two
+  // agree for every index in [-len, len); only indices below -len differ, and
+  // those read out of bounds in Paddle too.
+  auto index_info = GetInput(1);
+  auto output_info = GetOutput(0);
+  auto position = helper_->Squeeze(index_info[0].name, {0});
+  std::string arr_name = GetTensorArrayName();
+  helper_->MakeNode(
+      "SequenceAt", {arr_name, position}, {output_info[0].name});
 }
 
 }  // namespace paddle2onnx
