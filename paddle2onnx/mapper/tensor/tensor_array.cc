@@ -32,8 +32,15 @@ int32_t CreateArrayMapper::GetMinOpsetVersion(bool verbose) {
 
 void CreateArrayMapper::Opset11() {
   auto output_info = GetOutput(0);
+  // Paddle leaves create_array's `dtype` attribute as Undefined(ALL_DTYPE); the
+  // element type lives on the DenseTensorArrayType of the result instead.
+  // Emitting the attribute value made SequenceEmpty carry dtype 0, which ONNX
+  // Runtime rejects with "Invalid tensor data type 0" as soon as anything
+  // downstream needs the sequence's type.
+  int32_t elem_dtype =
+      dtype_ == P2ODataType::UNDEFINED ? output_info[0].dtype : dtype_;
   auto node = helper_->MakeNode("SequenceEmpty", {}, {output_info[0].name});
-  AddAttribute(node, "dtype", GetOnnxDtype(dtype_));
+  AddAttribute(node, "dtype", GetOnnxDtype(elem_dtype));
   SetTensorArrayName(output_info[0].name);
 }
 int32_t ArrayLengthMapper::GetMinOpsetVersion(bool verbose) {
