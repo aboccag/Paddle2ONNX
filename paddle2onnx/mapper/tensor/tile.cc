@@ -52,7 +52,31 @@ void TileMapper::Opset10() {
     auto expand_repeats =
         helper_->MakeNode("Slice", {ones, zero, need_expand, zero})->output(0);
     repeats = helper_->Concat({expand_repeats, repeats}, 0);
-    helper_->MakeNode("Tile", {x_info[0].name, repeats}, {out_info[0].name});
+
+    // The mirror case: when repeat_times is *longer* than x's rank Paddle
+    // promotes x by prepending 1-sized dimensions, while ONNX Tile requires
+    // len(repeats) == rank(x) exactly. Without this the produced model fails
+    // to load with "Invalid value of attribute 'axis'. Rank=2 Value=2" at the
+    // first consumer that indexes one of the promoted axes.
+    std::string x_name = x_info[0].name;
+    auto x_diff = helper_->MakeNode("Sub", {repeats_shape, x_rank})->output(0);
+    auto fp64_x_diff =
+        helper_->AutoCast(x_diff, P2ODataType::INT64, P2ODataType::FP64);
+    auto need_promote =
+        helper_->MakeNode("Max", {fp64_x_diff, fp64_zero})->output(0);
+    need_promote =
+        helper_->AutoCast(need_promote, P2ODataType::FP64, P2ODataType::INT64);
+    auto repeat_ones = helper_->ConstOfShape(
+        repeats_shape, ONNX_NAMESPACE::TensorProto::INT64,
+        static_cast<int64_t>(1));
+    auto x_prefix =
+        helper_->MakeNode("Slice", {repeat_ones, zero, need_promote, zero})
+            ->output(0);
+    auto promoted_shape = helper_->Concat(
+        {x_prefix, helper_->MakeNode("Shape", {x_name})->output(0)}, 0);
+    x_name = helper_->MakeNode("Reshape", {x_name, promoted_shape})->output(0);
+
+    helper_->MakeNode("Tile", {x_name, repeats}, {out_info[0].name});
   }
 }
 
