@@ -78,6 +78,26 @@ def _drop_inferred_value_info(graph, exporter_value_infos):
             g.value_info.extend(keep)
 
 
+def _restore_io_shapes(folded_graph, original_graph):
+    """Put back the input/output shapes the exporter declared.
+
+    Constant folding must not change the model's signature, but Polygraphy
+    writes the results of its symbolic shape inference onto the graph inputs as
+    well as onto intermediates -- and that inference is not sound. On CenterNet
+    it decides that `scale_factor` has 100 rows, because 100 is the head's
+    max-detections constant and the inference merges the two dimensions, so the
+    folded model rejects the [1, 2] every other detector takes and cannot be
+    driven at all. The exporter derived these shapes from the Paddle program's
+    own `pd_op.data` types; nothing downstream is entitled to sharpen them.
+    """
+    for folded, original in ((folded_graph.input, original_graph.input),
+                             (folded_graph.output, original_graph.output)):
+        declared = {vi.name: vi.type for vi in original}
+        for vi in folded:
+            if vi.name in declared:
+                vi.type.CopyFrom(declared[vi.name])
+
+
 def get_tmp_dir_and_file(model_filename, suffix=""):
     global PADDLE2ONNX_EXPORT_TEMP_DIR
     if PADDLE2ONNX_EXPORT_TEMP_DIR is None:
@@ -388,8 +408,13 @@ def export(
                 model_stream = io.BytesIO(onnx_model_str)
                 onnx_model = onnx.load_model(model_stream)
                 exporter_value_infos = _collect_value_info_names(onnx_model.graph)
+                # A snapshot: fold_constants may rewrite the model in place.
+                exporter_io = onnx.GraphProto()
+                exporter_io.input.extend(onnx_model.graph.input)
+                exporter_io.output.extend(onnx_model.graph.output)
                 folded_model = fold_constants(onnx_model)
                 _drop_inferred_value_info(folded_model.graph, exporter_value_infos)
+                _restore_io_shapes(folded_model.graph, exporter_io)
                 onnx.checker.check_model(folded_model, full_check=True)
                 origin_rank_list = []
                 folded_rank_list = []
