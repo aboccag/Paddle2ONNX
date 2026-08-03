@@ -16,9 +16,10 @@
 namespace paddle2onnx {
 
 REGISTER_MAPPER(fill_constant_batch_size_like, FillConstantBatchSizeLikeMapper)
+REGISTER_PIR_MAPPER(full_batch_size_like, FillConstantBatchSizeLikeMapper)
 
 int32_t FillConstantBatchSizeLikeMapper::GetMinOpsetVersion(bool verbose) {
-  auto out_info = GetOutput("Out");
+  auto out_info = HasOutput("Out") ? GetOutput("Out") : GetOutput("out");
   if (out_info[0].dtype == P2ODataType::BOOL) {
     Error() << "Dtype of boolean is not supported." << std::endl;
     return -1;
@@ -27,8 +28,8 @@ int32_t FillConstantBatchSizeLikeMapper::GetMinOpsetVersion(bool verbose) {
 }
 
 void FillConstantBatchSizeLikeMapper::Opset7() {
-  auto input_info = GetInput("Input");
-  auto out_info = GetOutput("Out");
+  auto input_info = HasInput("Input") ? GetInput("Input") : GetInput("input");
+  auto out_info = HasOutput("Out") ? GetOutput("Out") : GetOutput("out");
   float value = value_;
   if (!str_value_.empty()) {
     std::stringstream convert_stream(str_value_);
