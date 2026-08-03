@@ -123,6 +123,7 @@ class PaddlePirParser {
                         int64_t input_idx,
                         bool if_in_sub_block) const;
   std::string GetOpOutputName(const pir::Value& source) const;
+
   template <typename T>
   bool TryGetTensorValue(int64_t op_id,
                          int64_t input_idx,
@@ -147,9 +148,15 @@ class PaddlePirParser {
     std::string attr_value = "value";
     std::string attr_values = "values";
     pir::Operation* op = temp_op->operand(input_idx).source().defining_op();
-    while (op->num_operands() > 0 && !op->HasAttribute(attr_value) &&
-           !op->HasAttribute(attr_values)) {
+    // The walk stops at a value with no defining operation -- a block argument
+    // inside a while body, for one. Following that null was a segfault, not a
+    // "cannot determine the value" answer.
+    while (op != nullptr && op->num_operands() > 0 &&
+           !op->HasAttribute(attr_value) && !op->HasAttribute(attr_values)) {
       op = op->operand(0).source().defining_op();
+    }
+    if (op == nullptr) {
+      return false;
     }
     if (op->HasAttribute(attr_value)) {
       attr_name = attr_value;
@@ -160,8 +167,17 @@ class PaddlePirParser {
     }
     int32_t dtype = tensor_info.dtype;
 
-    auto array_list =
-        op->attribute(attr_name).dyn_cast<::pir::ArrayAttribute>().AsVector();
+    // `value` is not always an array: pd_op.full carries a scalar there. The
+    // unguarded dyn_cast returned a null attribute and AsVector() dereferenced
+    // it, which is how a model containing a plain pd_op.full crashed the
+    // converter outright. Report "not a constant vector" rather than passing
+    // the scalar off as a one-element one -- callers ask this to decide whether
+    // they may fold the value, and a wrong yes is worse than a no.
+    auto attr = op->attribute(attr_name);
+    if (!attr.isa<::pir::ArrayAttribute>()) {
+      return false;
+    }
+    auto array_list = attr.dyn_cast<::pir::ArrayAttribute>().AsVector();
     if (array_list.size() > 0) {
       if (array_list[0].isa<::pir::FloatAttribute>()) {
         std::vector<float> res;
@@ -222,9 +238,14 @@ class PaddlePirParser {
     std::string attr_name;
     std::string attr_value = "value";
     std::string attr_values = "values";
-    while (op->num_operands() > 0 && !op->HasAttribute(attr_value) &&
-           !op->HasAttribute(attr_values)) {
+    // Same as the vector overload: a value with no defining operation ends the
+    // walk instead of being dereferenced.
+    while (op != nullptr && op->num_operands() > 0 &&
+           !op->HasAttribute(attr_value) && !op->HasAttribute(attr_values)) {
       op = op->operand(0).source().defining_op();
+    }
+    if (op == nullptr) {
+      return false;
     }
     if (op->HasAttribute(attr_value)) {
       attr_name = attr_value;

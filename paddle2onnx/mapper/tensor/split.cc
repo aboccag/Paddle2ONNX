@@ -109,11 +109,16 @@ std::string SplitMapper::GetSections(int64_t dimension) {
     splits = helper_->ConcatIndices(info);
   } else if (HasAttr("num")) {
     GetAttr("num", &num_);
-    Assert(dimension > 0,
-           "Cannot convert split op, due to target dimension is dynamic.");
-    int64_t each_part_size = dimension / num_;
-    sections_ = std::vector<int64_t>(num_, each_part_size);
-    sections_[num_ - 1] += dimension % num_;
+    if (dimension > 0) {
+      int64_t each_part_size = dimension / num_;
+      sections_ = std::vector<int64_t>(num_, each_part_size);
+      sections_[num_ - 1] += dimension % num_;
+    }
+    // A dynamic dimension used to abort here. It need not: splitting into `num`
+    // parts is exactly what ONNX does when Split is given no explicit sizes,
+    // and Paddle's split-by-number requires the axis to divide evenly anyway,
+    // so the remainder this branch would have added to the last part is always
+    // zero. Leaving sections_ empty makes the callers emit that plain Split.
   }
   return splits;
 }
@@ -164,9 +169,13 @@ void SplitMapper::Opset7() {
     ProcessSections(input_info[0].shape[axis]);
   } else if (HasAttr("num")) {
     GetAttr("num", &num_);
-    int64_t each_part_size = input_info[0].shape[axis] / num_;
-    sections_ = std::vector<int64_t>(num_, each_part_size);
-    sections_[num_ - 1] += input_info[0].shape[axis] % num_;
+    // Same as GetSections: a dynamic axis leaves sections_ empty, and the
+    // helper then emits the equal-sized Split that Paddle's semantics mean.
+    if (input_info[0].shape[axis] > 0) {
+      int64_t each_part_size = input_info[0].shape[axis] / num_;
+      sections_ = std::vector<int64_t>(num_, each_part_size);
+      sections_[num_ - 1] += input_info[0].shape[axis] % num_;
+    }
   } else {
     Assert(false, "Split op must have sections or num attribute.");
   }

@@ -17,14 +17,27 @@
 
 #include <iostream>
 #include <sstream>
+#include <stdexcept>
 #include <string>
 
 namespace paddle2onnx {
 
+// Thrown by Assert. Caught at the two Export entry points, which turn it into
+// the ordinary "conversion failed" return the Python layer already handles.
+class ConversionError : public std::runtime_error {
+ public:
+  explicit ConversionError(const std::string& message)
+      : std::runtime_error(message) {}
+};
+
+// A refused model must not take the process down with it. std::abort() gave the
+// caller a SIGABRT with no way to report which model failed or why -- fatal
+// inside a conversion worker, and indistinguishable from a genuine crash in a
+// sweep. The message is still printed; it is now also recoverable.
 inline void Assert(bool condition, const std::string& message) {
   if (!condition) {
     fprintf(stderr, "[ERROR][Paddle2ONNX] %s\n", message.c_str());
-    std::abort();
+    throw ConversionError(message);
   }
 }
 

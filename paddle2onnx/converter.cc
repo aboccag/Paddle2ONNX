@@ -87,18 +87,27 @@ PADDLE2ONNX_DECL bool Export(const char *model_filename,
       }
     }
     std::string calibration_str;
-    std::string result = me.Run(pir_parser,
-                                opset_version,
-                                auto_upgrade_opset,
-                                verbose,
-                                enable_onnx_checker,
-                                enable_experimental_op,
-                                enable_optimize,
-                                deploy_backend,
-                                &calibration_str,
-                                external_file,
-                                save_external,
-                                export_fp16_model);
+    std::string result;
+    // A model the exporter refuses is a failed conversion, not a reason to
+    // take the process down: Assert used to abort() from deep inside a mapper.
+    try {
+      result = me.Run(pir_parser,
+                      opset_version,
+                      auto_upgrade_opset,
+                      verbose,
+                      enable_onnx_checker,
+                      enable_experimental_op,
+                      enable_optimize,
+                      deploy_backend,
+                      &calibration_str,
+                      external_file,
+                      save_external,
+                      export_fp16_model);
+    } catch (const ConversionError &e) {
+      P2OLogger(verbose) << "Paddle model convert failed: " << e.what()
+                         << std::endl;
+      return false;
+    }
     if (result.empty()) {
       P2OLogger(verbose) << "The exported ONNX model is invalid!" << std::endl;
       return false;
@@ -160,19 +169,26 @@ PADDLE2ONNX_DECL bool Export(const void *model_buffer,
     }
   }
   std::string calibration_str;
-  std::string result = me.Run(parser,
-                              opset_version,
-                              auto_upgrade_opset,
-                              verbose,
-                              enable_onnx_checker,
-                              enable_experimental_op,
-                              enable_optimize,
-                              deploy_backend,
-                              &calibration_str,
-                              external_file,
-                              save_external,
-                              export_fp16_model,
-                              disable_op_types);
+  std::string result;
+  try {
+    result = me.Run(parser,
+                    opset_version,
+                    auto_upgrade_opset,
+                    verbose,
+                    enable_onnx_checker,
+                    enable_experimental_op,
+                    enable_optimize,
+                    deploy_backend,
+                    &calibration_str,
+                    external_file,
+                    save_external,
+                    export_fp16_model,
+                    disable_op_types);
+  } catch (const ConversionError &e) {
+    P2OLogger(verbose) << "Paddle model convert failed: " << e.what()
+                       << std::endl;
+    return false;
+  }
   if (result.empty()) {
     P2OLogger(verbose) << "The exported ONNX model is invalid!" << std::endl;
     return false;
