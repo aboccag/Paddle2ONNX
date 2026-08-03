@@ -35,6 +35,20 @@ class FillConstantBatchSizeLikeMapper : public Mapper {
     GetAttr("output_dim_idx", &output_dim_idx_);
   }
 
+  // PIR calls the op full_batch_size_like and carries the fill value in the
+  // numeric `value` attribute only -- there is no str_value counterpart.
+  FillConstantBatchSizeLikeMapper(const PaddlePirParser& p,
+                                  OnnxHelper* helper,
+                                  int64_t op_id,
+                                  bool if_in_cf_block)
+      : Mapper(p, helper, op_id, if_in_cf_block) {
+    in_pir_mode = true;
+    GetAttr("value", &value_);
+    GetAttr("shape", &shape_);
+    GetAttr("input_dim_idx", &input_dim_idx_);
+    GetAttr("output_dim_idx", &output_dim_idx_);
+  }
+
   int32_t GetMinOpsetVersion(bool verbose);
   void Opset7() override;
 
