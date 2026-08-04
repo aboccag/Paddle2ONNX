@@ -46,6 +46,17 @@ class RoiAlignMapper : public Mapper {
   }
 
   int32_t GetMinOpsetVersion(bool verbose) override {
+    // RoiAlign only grew coordinate_transformation_mode at opset 16, and every
+    // earlier version behaves as output_half_pixel -- Paddle's aligned=false.
+    // An aligned=true op therefore cannot be expressed below 16: the exported
+    // graph would load, run, and be offset by half a pixel, which is a silent
+    // wrongness rather than a missing feature. Ask for 16 instead.
+    if (aligned_) {
+      Logger(verbose, 16) << "aligned=true requires coordinate_transformation_"
+                             "mode, which RoiAlign only has from opset 16. "
+                          << RequireOpset(16) << std::endl;
+      return 16;
+    }
     Logger(verbose, 10) << RequireOpset(10) << std::endl;
     return 10;
   }
