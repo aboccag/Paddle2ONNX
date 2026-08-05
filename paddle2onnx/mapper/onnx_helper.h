@@ -91,8 +91,26 @@ class OnnxHelper {
   // zero information corresponding to each tensor
   std::map<std::string, QuantizeInfo> quantize_info;
 
+  // Small anonymous Constant nodes, keyed by their contents.
+  //
+  // The helpers below emit a fresh Constant for every axis list, every shape
+  // vector, every scalar bound -- Unsqueeze alone asks for one on each call.
+  // They are pure and immutable, so identical ones can share a node. On a
+  // transformer that builds its reshape targets at runtime this is not a
+  // cosmetic saving: CSWinTransformer_base_224 emits 9 357 of them into a
+  // 40 527-node graph, and every downstream consumer -- the ONNX optimiser,
+  // the constant folder, onnxruntime's own graph passes -- pays for each one.
+  //
+  // Scoped to this helper on purpose: a block gets its own OnnxHelper, so a
+  // name is never shared across a subgraph boundary. Cleared with `nodes`,
+  // because a cached name that outlived its node would dangle.
+  std::map<std::string, std::string> constant_cache;
+
   explicit OnnxHelper(bool verbose = false) : verbose_(verbose) {}
-  void Clear() { nodes.clear(); }
+  void Clear() {
+    nodes.clear();
+    constant_cache.clear();
+  }
 
   template <typename T>
   bool TryGetTensorValue(const std::string &name, std::vector<T> *value);
@@ -403,9 +421,44 @@ std::string OnnxHelper::Constant(const std::string &output,
   return output;
 }
 
+// Key for `constant_cache`. Only the contents that end up in the TensorProto
+// matter -- the ONNX dtype and the numeric values -- so two calls that differ
+// only in the C++ type they were handed still share a node. `%.17g` round-trips
+// a double exactly, which keeps the key faithful for float and double
+// constants; anything cheaper would merge two constants that are not equal.
+template <typename T>
+std::string ConstantCacheKey(ONNX_NAMESPACE::TensorProto_DataType dtype,
+                             const std::vector<int64_t> &shape,
+                             const std::vector<T> &value) {
+  std::string key = std::to_string(static_cast<int>(dtype));
+  for (auto d : shape) key += "," + std::to_string(d);
+  key += "|";
+  char buf[40];
+  for (auto v : value) {
+    snprintf(buf, sizeof(buf), "%.17g", static_cast<double>(v));
+    key += buf;
+    key += ",";
+  }
+  return key;
+}
+
+// Above this many elements a constant is a weight, not a shape or an axis list:
+// hashing it would cost more than the node it saves, and weights are not
+// repeated anyway.
+constexpr size_t kConstantCacheMaxNumel = 64;
+
 template <typename T>
 std::string OnnxHelper::Constant(ONNX_NAMESPACE::TensorProto_DataType dtype,
                                  const std::vector<T> &value) {
+  if (value.size() <= kConstantCacheMaxNumel) {
+    auto key = ConstantCacheKey(
+        dtype, {static_cast<int64_t>(value.size())}, value);
+    auto found = constant_cache.find(key);
+    if (found != constant_cache.end()) return found->second;
+    auto output = MapperHelper::Get()->GenName("helper.constant");
+    constant_cache[key] = output;
+    return Constant(output, dtype, value);
+  }
   auto output = MapperHelper::Get()->GenName("helper.constant");
   return Constant(output, dtype, value);
 }
@@ -474,6 +527,16 @@ template <typename T>
 std::string OnnxHelper::Constant(const std::vector<int64_t> &shape,
                                  ONNX_NAMESPACE::TensorProto_DataType dtype,
                                  T value) {
+  int64_t numel = 1;
+  for (auto d : shape) numel *= d;
+  if (numel > 0 && static_cast<size_t>(numel) <= kConstantCacheMaxNumel) {
+    auto key = ConstantCacheKey(dtype, shape, std::vector<T>{value});
+    auto found = constant_cache.find(key);
+    if (found != constant_cache.end()) return found->second;
+    auto output = MapperHelper::Get()->GenName("helper.constant");
+    constant_cache[key] = output;
+    return Constant(output, shape, dtype, value);
+  }
   auto output = MapperHelper::Get()->GenName("helper.constant");
   return Constant(output, shape, dtype, value);
 }
