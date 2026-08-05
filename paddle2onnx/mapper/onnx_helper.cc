@@ -308,11 +308,21 @@ std::shared_ptr<ONNX_NAMESPACE::NodeProto> OnnxHelper::MakeNode(
 std::string OnnxHelper::AutoCast(const std::string &input,
                                  int32_t input_paddle_dtype,
                                  int32_t to_paddle_dtype) {
-  std::string output = MapperHelper::Get()->GenName("auto.cast");
+  // A cast to the type the value already has is nothing. This overload picks
+  // its own output name, so no caller has a stake in what that name is, and the
+  // value can simply be handed back: ONNX values are single-assignment, which
+  // is exactly what the Identity was expressing.
+  //
+  // The overload below cannot do this -- there the caller asked for one
+  // particular output name, and an Identity is the only way to give it one.
+  //
+  // 250 call sites reach here, and on a graph that casts defensively the no-ops
+  // dominate: 5 316 of CSWinTransformer_base_224's 10 978 Identity nodes came
+  // from this branch, and 4 280 of those fed another Identity.
   if (input_paddle_dtype == to_paddle_dtype) {
-    MakeNode("Identity", {input}, {output});
-    return output;
+    return input;
   }
+  std::string output = MapperHelper::Get()->GenName("auto.cast");
   auto cast_node = MakeNode("Cast", {input}, {output});
   AddAttribute(cast_node, "to", GetOnnxDtype(to_paddle_dtype));
   return cast_node->output(0);
