@@ -384,7 +384,7 @@ def export(
                     "extract_constant_to_initializer",
                     "eliminate_unused_initializer",
                     "eliminate_duplicate_initializer",
-                    "eliminate_nop_cast ",
+                    "eliminate_nop_cast",
                 ]
                 optimized_model = onnxoptimizer.optimize(onnx_model, passes)
                 onnx.checker.check_model(optimized_model, full_check=True)
