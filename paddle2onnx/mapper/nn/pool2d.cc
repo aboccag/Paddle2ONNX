@@ -26,16 +26,79 @@ REGISTER_MAPPER(max_pool2d_with_index, Pool2dMapper)
 REGISTER_PIR_MAPPER(pool2d, Pool2dMapper)
 REGISTER_PIR_MAPPER(max_pool2d_with_index, Pool2dMapper)
 
-bool Pool2dMapper::IsSameSpan(const int64_t& in_size, const int64_t& out_size) {
-  std::vector<int64_t> spans;
-  spans.reserve(out_size);
-  for (auto i = 0; i < out_size; ++i) {
-    int64_t start = std::floor(i * (in_size / out_size));
-    int64_t end = std::ceil((i + 1) * (in_size / out_size));
-    spans.push_back(end - start);
+void Pool2dMapper::ExactAdaptiveAvgPool(
+    const std::vector<TensorInfo>& input_info,
+    const std::vector<TensorInfo>& output_info) {
+  // Paddle computes adaptive window i on each axis as
+  // [floor(i*in/out), ceil((i+1)*in/out)). When out does not evenly divide
+  // in, those windows have non-uniform strides and overlap, and no
+  // AveragePool(kernel, stride) samples them — the kernel/stride emission
+  // below averages different pixels and is silently wrong (found by numeric
+  // parity on PaddleSeg's PSP/SPPM heads: worst delta 2.8e-01 at 30->4
+  // against 3.3e-06 for the same weights at a divisible size).
+  //
+  // The pooling is separable, so it is emitted exactly instead: each output
+  // row/column is a fixed average of input rows/columns, i.e. a matrix
+  // product against a constant averaging matrix on each axis.
+  //   Y = A_h · X · A_w,  A_h [out_h, in_h], A_w [in_w, out_w]
+  // MatMul broadcasts the 2-D constants over [N, C, ·, ·], so two nodes and
+  // two small initializers cover any batch and channel count.
+  int64_t input_h = input_info[0].shape[2];
+  int64_t input_w = input_info[0].shape[3];
+  int64_t output_h = output_info[0].shape[2];
+  int64_t output_w = output_info[0].shape[3];
+
+  auto window = [](int64_t i, int64_t in, int64_t out, int64_t* start,
+                   int64_t* end) {
+    *start =
+        static_cast<int64_t>(std::floor(static_cast<double>(i * in) / out));
+    *end = static_cast<int64_t>(
+        std::ceil(static_cast<double>((i + 1) * in) / out));
+  };
+
+  std::vector<float> row_weights(output_h * input_h, 0.0f);
+  for (int64_t i = 0; i < output_h; ++i) {
+    int64_t start = 0;
+    int64_t end = 0;
+    window(i, input_h, output_h, &start, &end);
+    for (int64_t k = start; k < end; ++k) {
+      row_weights[i * input_h + k] = 1.0f / static_cast<float>(end - start);
+    }
   }
-  std::sort(spans.begin(), spans.end());
-  return spans[0] == spans[spans.size() - 1];
+  std::vector<float> col_weights(input_w * output_w, 0.0f);
+  for (int64_t j = 0; j < output_w; ++j) {
+    int64_t start = 0;
+    int64_t end = 0;
+    window(j, input_w, output_w, &start, &end);
+    for (int64_t k = start; k < end; ++k) {
+      col_weights[k * output_w + j] = 1.0f / static_cast<float>(end - start);
+    }
+  }
+
+  std::vector<int64_t> row_shape = {output_h, input_h};
+  std::vector<int64_t> col_shape = {input_w, output_w};
+  std::string rows = helper_->Constant(
+      row_shape, ONNX_NAMESPACE::TensorProto_DataType_FLOAT, row_weights);
+  std::string cols = helper_->Constant(
+      col_shape, ONNX_NAMESPACE::TensorProto_DataType_FLOAT, col_weights);
+
+  std::string input = input_info[0].name;
+  bool needs_cast = kNoNeedCastTypesOpSet7.find(input_info[0].dtype) ==
+                    kNoNeedCastTypesOpSet7.end();
+  if (needs_cast) {
+    input = helper_->AutoCast(input, input_info[0].dtype, P2ODataType::FP32);
+  }
+  auto pooled_rows = helper_->MakeNode("MatMul", {rows, input});
+  if (needs_cast) {
+    auto pooled = helper_->MakeNode("MatMul", {pooled_rows->output(0), cols});
+    helper_->AutoCast(pooled->output(0),
+                      output_info[0].name,
+                      P2ODataType::FP32,
+                      output_info[0].dtype);
+  } else {
+    helper_->MakeNode(
+        "MatMul", {pooled_rows->output(0), cols}, {output_info[0].name});
+  }
 }
 
 void Pool2dMapper::AdaptivePool(const std::vector<TensorInfo>& input_info,
@@ -249,11 +312,29 @@ int32_t Pool2dMapper::GetMinOpsetVersion(bool verbose) {
     int64_t input_w = input_info[0].shape[3];
     int64_t output_h = output_info[0].shape[2];
     int64_t output_w = output_info[0].shape[3];
-    if (output_h == -1 || output_w == -1 || !IsSameSpan(input_h, output_h) ||
-        !IsSameSpan(input_w, output_w)) {
+    if (output_h == -1 || output_w == -1) {
       Error() << "Cannot convert adaptive pool with input_size: " << input_h
-              << " " << input_h << " output_size: " << output_h << " "
+              << " " << input_w << " output_size: " << output_h << " "
               << output_w << std::endl;
+      return -1;
+    }
+    // Divisibility is the only condition under which kernel = stride = in/out
+    // reproduces Paddle's [floor(i*in/out), ceil((i+1)*in/out)) windows. The
+    // predecessor of this check compared window *sizes* computed with integer
+    // division, which both truncated the ratio to a constant (so every window
+    // looked identical) and said nothing about strides — 30 -> 4 passed it
+    // and converted to a pool that averages different pixels than Paddle's.
+    // Non-divisible average pooling is emitted exactly instead (see
+    // ExactAdaptiveAvgPool); max pooling is not linear and has no such form,
+    // so it is refused rather than approximated.
+    bool divisible = (input_h % output_h == 0) && (input_w % output_w == 0);
+    bool is_average = convert_pir_op_name(OpType()) != "max_pool2d_with_index" &&
+                      pooling_type_ == "avg";
+    if (!divisible && !is_average) {
+      Error() << "Adaptive max pool whose output does not evenly divide its "
+                 "input cannot be expressed as an ONNX MaxPool. input_size: "
+              << input_h << " " << input_w << " output_size: " << output_h
+              << " " << output_w << std::endl;
       return -1;
     }
   }
@@ -322,7 +403,16 @@ void Pool2dMapper::Opset7() {
           output, output_info[0].name, P2ODataType::FP32, output_info[0].dtype);
     }
   } else if (adaptive_) {
-    AdaptivePool(input_info, output_info);
+    int64_t input_h = input_info[0].shape[2];
+    int64_t input_w = input_info[0].shape[3];
+    int64_t output_h = output_info[0].shape[2];
+    int64_t output_w = output_info[0].shape[3];
+    if (input_h % output_h == 0 && input_w % output_w == 0) {
+      AdaptivePool(input_info, output_info);
+    } else {
+      // GetMinOpsetVersion only lets average pooling through here.
+      ExactAdaptiveAvgPool(input_info, output_info);
+    }
   } else {
     NoAdaptivePool(input_info, output_info);
   }

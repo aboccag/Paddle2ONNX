@@ -26,15 +26,14 @@ REGISTER_MAPPER(max_pool3d_with_index, Pool3dMapper)
 REGISTER_PIR_MAPPER(max_pool3d_with_index, Pool3dMapper)
 
 bool Pool3dMapper::IsSameSpan(const int64_t& in_size, const int64_t& out_size) {
-  std::vector<int64_t> spans;
-  spans.reserve(out_size);
-  for (auto i = 0; i < out_size; ++i) {
-    int64_t start = std::floor(i * (in_size / out_size));
-    int64_t end = std::ceil((i + 1) * (in_size / out_size));
-    spans.push_back(end - start);
-  }
-  std::sort(spans.begin(), spans.end());
-  return spans[0] == spans[spans.size() - 1];
+  // Divisibility is the only condition under which kernel = stride = in/out
+  // reproduces Paddle's [floor(i*in/out), ceil((i+1)*in/out)) windows. The
+  // previous body compared window sizes computed with integer division, which
+  // truncated the ratio to a constant and said nothing about strides — a
+  // non-divisible pool passed it and converted to one that averages different
+  // elements than Paddle's (see the 2-D mapper, where the average case is now
+  // emitted exactly; 3-D keeps the refusal).
+  return in_size % out_size == 0;
 }
 
 void Pool3dMapper::AdaptivePool(const std::vector<TensorInfo>& input_info,

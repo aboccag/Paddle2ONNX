@@ -92,7 +92,8 @@ class Pool2dMapper : public Mapper {
   void Opset7() override;
 
  private:
-  bool IsSameSpan(const int64_t& in_size, const int64_t& out_size);
+  void ExactAdaptiveAvgPool(const std::vector<TensorInfo>& input_info,
+                            const std::vector<TensorInfo>& output_info);
   void AdaptivePool(const std::vector<TensorInfo>& input_info,
                     const std::vector<TensorInfo>& output_info);
   void NoAdaptivePool(const std::vector<TensorInfo>& input_info,
