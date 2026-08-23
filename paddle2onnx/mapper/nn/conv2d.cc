@@ -24,11 +24,7 @@ REGISTER_PIR_MAPPER(conv2d, Conv2dMapper)
 REGISTER_PIR_MAPPER(depthwise_conv2d, Conv2dMapper)
 
 int32_t Conv2dMapper::GetMinOpsetVersion(bool verbose) {
-  // NHWC is not supported
-  if (data_format_ == "NHWC") {
-    Error() << "Cannot support input with NHWC format." << std::endl;
-    return -1;
-  }
+  // NHWC is handled by transposing around the operator -- see Opset7.
   if (padding_algorithm_ == "EXPLICIT") {
     if (paddings_.size() != 2 && paddings_.size() != 4) {
       Error() << "While padding_algorithm is EXPLICIT, size of paddings should "
@@ -52,8 +48,24 @@ void Conv2dMapper::Opset7() {
   auto kernel_info = GetInput("Filter");
   auto output_info = GetOutput("Output");
 
-  auto node = helper_->MakeNode(
-      "Conv", {input_info[0].name, kernel_info[0].name}, {output_info[0].name});
+  // ONNX's Conv is NCHW only, so an NHWC activation is transposed in and back
+  // out again -- the same shape Conv3dTransposeMapper uses for NDHWC. The
+  // filter is NOT transposed: Paddle stores it as [out, in, kh, kw] whatever
+  // data_format says, which is already the layout ONNX wants (and is why
+  // kernel_shape below still reads shape[2] and shape[3]).
+  std::string input = input_info[0].name;
+  const bool nhwc = data_format_ == "NHWC";
+  if (nhwc) {
+    input = helper_->Transpose(input, {0, 3, 1, 2});  // NHWC -> NCHW
+  }
+
+  // On the NCHW path the node still writes the graph output directly, so that
+  // path emits exactly what it emitted before this branch existed.
+  auto node =
+      nhwc ? helper_->MakeNode("Conv", {input, kernel_info[0].name})
+           : helper_->MakeNode("Conv",
+                               {input, kernel_info[0].name},
+                               {output_info[0].name});
   AddAttribute(node, "dilations", dilations_);
   std::vector<int64_t> kernel_shape = {kernel_info[0].shape[2],
                                        kernel_info[0].shape[3]};
@@ -77,6 +89,11 @@ void Conv2dMapper::Opset7() {
       paddings[2] = paddings_[1];
     }
     AddAttribute(node, "pads", paddings);
+  }
+
+  if (nhwc) {
+    helper_->Transpose(
+        node->output(0), output_info[0].name, {0, 2, 3, 1});  // NCHW -> NHWC
   }
 }
 

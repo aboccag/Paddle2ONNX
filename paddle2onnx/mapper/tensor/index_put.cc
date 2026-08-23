@@ -79,16 +79,55 @@ void IndexPutMapper::Opset11() {
     }
   } else {
     // Integer indexing: use ScatterND
-    std::vector<std::string> indices_names;
+    //
+    // The index tensors are broadcast against each other first. Paddle follows
+    // numpy's advanced-indexing rule, where x[i, j] with i of shape [n] and j
+    // of shape [m, 1] indexes an [m, n] region -- the index tensors do not have
+    // to agree, only to broadcast. Concat does not broadcast: it demands
+    // equality on every axis but the concatenated one. Unsqueezing and
+    // concatenating straight away therefore emits a graph that converts, and
+    // that onnxruntime then refuses at load with
+    //   Node (Concat.N) Op (Concat) [ShapeInferenceError] Can't merge shape
+    //   info. Both inferred and declared dimension have values but they differ.
+    // Measured on co_dino_r50_1x_coco, whose three index tensors resolve to
+    // [?,1,1], [1,?,1] and [?,?,1] -- broadcastable, not equal.
+    //
+    // Adding a zero of the common broadcast shape to each operand is what
+    // aligns them: Add and Mul broadcast by the same numpy rule Paddle used, so
+    // the result is exact rather than a reshape that guesses. It needs no
+    // static shapes, which matters because these indices are computed at run
+    // time (here, from a TopK over the query dimension).
+    std::vector<std::string> cast_names;
     for (size_t i = 0; i < indices_info.size(); ++i) {
-      // Cast indices to INT64 if needed
-      std::string idx_name = helper_->AutoCast(
-          indices_info[i].name, indices_info[i].dtype, P2ODataType::INT64);
+      cast_names.push_back(helper_->AutoCast(
+          indices_info[i].name, indices_info[i].dtype, P2ODataType::INT64));
+    }
+
+    std::vector<std::string> aligned_names = cast_names;
+    if (cast_names.size() > 1) {
+      std::string zero = helper_->Constant(
+          ONNX_NAMESPACE::TensorProto::INT64, std::vector<int64_t>{0});
+      // A zero carrying the broadcast shape of every index tensor.
+      std::string zeros =
+          helper_->MakeNode("Mul", {cast_names[0], zero})->output(0);
+      for (size_t i = 1; i < cast_names.size(); ++i) {
+        std::string zero_i =
+            helper_->MakeNode("Mul", {cast_names[i], zero})->output(0);
+        zeros = helper_->MakeNode("Add", {zeros, zero_i})->output(0);
+      }
+      for (size_t i = 0; i < cast_names.size(); ++i) {
+        aligned_names[i] =
+            helper_->MakeNode("Add", {cast_names[i], zeros})->output(0);
+      }
+    }
+
+    std::vector<std::string> indices_names;
+    for (size_t i = 0; i < aligned_names.size(); ++i) {
       // Unsqueeze each index tensor to add a dimension at the end
       std::string axes_node = helper_->Constant(
           ONNX_NAMESPACE::TensorProto::INT64, std::vector<int64_t>{-1});
       auto unsqueeze_node =
-          helper_->MakeNode("Unsqueeze", {idx_name, axes_node});
+          helper_->MakeNode("Unsqueeze", {aligned_names[i], axes_node});
       indices_names.push_back(unsqueeze_node->output(0));
     }
 

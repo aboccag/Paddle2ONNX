@@ -35,6 +35,23 @@ void BatchNormMapper::Opset7() {
   auto variance_info = GetInput("Variance");
   auto output_info = GetOutput("Y");
 
+  // ONNX's BatchNormalization reads channels at axis 1, and this mapper never
+  // consulted data_format_ -- although the PIR constructor has always parsed
+  // it. Under NHWC it therefore handed a channels-last tensor to a channels-
+  // first operator, producing a graph that converts and is then refused at
+  // load:
+  //   Node (BatchNormalization.0) [ShapeInferenceError] Dimension mismatch in
+  //   unification between 64 and 112
+  // -- 64 channels against a 112 spatial extent. Unlike conv2d and pool2d this
+  // one never refused, because it did not know there was anything to refuse.
+  const bool nhwc = data_format_ == "NHWC";
+  std::string nhwc_final_output;
+  if (nhwc) {
+    input_info[0].name = helper_->Transpose(input_info[0].name, {0, 3, 1, 2});
+    nhwc_final_output = output_info[0].name;
+    output_info[0].name = MapperHelper::Get()->GenName("batch_norm.nchw");
+  }
+
   std::string scale_name, bias_name;
   int64_t numel = 1;
   for (auto s : mean_info[0].shape) {
@@ -70,6 +87,11 @@ void BatchNormMapper::Opset7() {
 
   AddAttribute(node, "epsilon", epsilon_);
   AddAttribute(node, "momentum", momentum_);
+
+  if (nhwc) {
+    helper_->Transpose(
+        output_info[0].name, nhwc_final_output, {0, 2, 3, 1});
+  }
 }
 
 void BatchNormMapper::Opset14() {
@@ -77,6 +99,15 @@ void BatchNormMapper::Opset14() {
   auto mean_info = GetInput("Mean");
   auto variance_info = GetInput("Variance");
   auto output_info = GetOutput("Y");
+
+  // Same transpose-around as Opset7 above; see the comment there.
+  const bool nhwc = data_format_ == "NHWC";
+  std::string nhwc_final_output;
+  if (nhwc) {
+    input_info[0].name = helper_->Transpose(input_info[0].name, {0, 3, 1, 2});
+    nhwc_final_output = output_info[0].name;
+    output_info[0].name = MapperHelper::Get()->GenName("batch_norm.nchw");
+  }
   auto mean_out_info = GetOutput("MeanOut");
   auto variance_out_info = GetOutput("VarianceOut");
 
@@ -123,6 +154,11 @@ void BatchNormMapper::Opset14() {
   AddAttribute(node, "momentum", momentum_);
   AddAttribute(
       node, "training_mode", static_cast<int64_t>(trainable_statistics_));
+
+  if (nhwc) {
+    helper_->Transpose(
+        output_info[0].name, nhwc_final_output, {0, 2, 3, 1});
+  }
 }
 
 }  // namespace paddle2onnx

@@ -26,6 +26,19 @@ REGISTER_MAPPER(max_pool2d_with_index, Pool2dMapper)
 REGISTER_PIR_MAPPER(pool2d, Pool2dMapper)
 REGISTER_PIR_MAPPER(max_pool2d_with_index, Pool2dMapper)
 
+namespace {
+// Every shape index in this file is written for NCHW -- `shape[2]` and
+// `shape[3]` are read as H and W in both GetMinOpsetVersion and Opset7, and the
+// pooling attributes (ksize, strides, paddings) are in H,W order whatever
+// data_format says. Rather than teach four emission paths about the layout, an
+// NHWC shape is permuted into NCHW here and the activation itself is transposed
+// once in Opset7. Nothing else in the file has to know.
+inline std::vector<int64_t> NhwcShapeToNchw(const std::vector<int64_t>& shape) {
+  if (shape.size() != 4) return shape;
+  return {shape[0], shape[3], shape[1], shape[2]};
+}
+}  // namespace
+
 void Pool2dMapper::ExactAdaptiveAvgPool(
     const std::vector<TensorInfo>& input_info,
     const std::vector<TensorInfo>& output_info) {
@@ -260,13 +273,15 @@ void Pool2dMapper::NoAdaptivePool(const std::vector<TensorInfo>& input_info,
 }
 
 int32_t Pool2dMapper::GetMinOpsetVersion(bool verbose) {
-  // NHWC is not supported : todo support NHWC
-  if (data_format_ == "NHWC") {
-    Error() << "NHWC format is not supported." << std::endl;
-    return -1;
-  }
+  // NHWC is handled by transposing around the whole operator -- see Opset7.
+  // The shapes are permuted here too: the adaptive checks below divide
+  // shape[2]/shape[3] as H and W, and under NHWC those are W and C.
   auto input_info = GetInput("X");
   auto output_info = GetOutput("Out");
+  if (data_format_ == "NHWC") {
+    input_info[0].shape = NhwcShapeToNchw(input_info[0].shape);
+    output_info[0].shape = NhwcShapeToNchw(output_info[0].shape);
+  }
   if (in_pir_mode) {
     if (convert_pir_op_name(OpType()) != "max_pool2d_with_index") {
       // TODO(qinzhongyu): For PIR, kernel size is in inputs
@@ -359,6 +374,23 @@ int32_t Pool2dMapper::GetMinOpsetVersion(bool verbose) {
 void Pool2dMapper::Opset7() {
   auto input_info = GetInput("X");
   auto output_info = GetOutput("Out");
+
+  // NHWC: transpose the activation into NCHW, let the four emission paths below
+  // run exactly as they do for NCHW, then transpose the result back. The
+  // pooling itself is layout-agnostic once the tensor is in the layout ONNX's
+  // MaxPool/AveragePool require, which is NCHW only.
+  const bool nhwc = data_format_ == "NHWC";
+  std::string nhwc_final_output;
+  if (nhwc) {
+    input_info[0].name = helper_->Transpose(input_info[0].name, {0, 3, 1, 2});
+    input_info[0].shape = NhwcShapeToNchw(input_info[0].shape);
+    // The paths below write straight to output_info[0].name, so they are given
+    // a temporary and the real graph output is produced by the transpose.
+    nhwc_final_output = output_info[0].name;
+    output_info[0].name = MapperHelper::Get()->GenName("pool2d.nchw");
+    output_info[0].shape = NhwcShapeToNchw(output_info[0].shape);
+  }
+
   if (in_pir_mode) {
     /**
     // TODO: For PIR, kernel size is in inputs
@@ -415,6 +447,11 @@ void Pool2dMapper::Opset7() {
     }
   } else {
     NoAdaptivePool(input_info, output_info);
+  }
+
+  if (nhwc) {
+    helper_->Transpose(
+        output_info[0].name, nhwc_final_output, {0, 2, 3, 1});  // NCHW -> NHWC
   }
 }
 
