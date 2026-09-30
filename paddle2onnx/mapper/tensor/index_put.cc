@@ -123,7 +123,22 @@ void IndexPutMapper::Opset11() {
 
     std::vector<std::string> indices_names;
     for (size_t i = 0; i < aligned_names.size(); ++i) {
-      // Unsqueeze each index tensor to add a dimension at the end
+      // Unsqueeze each index tensor to add a dimension at the end.
+      //
+      // Before opset 13 Unsqueeze takes its axes as an attribute, not an
+      // input, and GetMinOpsetVersion admits opset 11 -- so the input form
+      // wrote a graph onnxruntime refuses at load ("has input size 2 not in
+      // range [min=1, max=1]") for every integer index_put below 13.
+      // helper_->Unsqueeze would pick the form, but it rejects the negative
+      // axis this needs; opset 11 accepts -1 as an attribute. From 13 on the
+      // emission is exactly what it was.
+      if (helper_->GetOpsetVersion() < 13) {
+        auto unsqueeze_node =
+            helper_->MakeNode("Unsqueeze", {aligned_names[i]});
+        AddAttribute(unsqueeze_node, "axes", std::vector<int64_t>{-1});
+        indices_names.push_back(unsqueeze_node->output(0));
+        continue;
+      }
       std::string axes_node = helper_->Constant(
           ONNX_NAMESPACE::TensorProto::INT64, std::vector<int64_t>{-1});
       auto unsqueeze_node =
