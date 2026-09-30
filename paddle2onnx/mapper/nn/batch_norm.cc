@@ -29,6 +29,30 @@ int32_t BatchNormMapper::GetMinOpsetVersion(bool verbose) {
   return 7;
 }
 
+namespace {
+// Paddle's batch_norm collapses every channels-last layout onto one attribute
+// value: F.batch_norm maps NLC, NHWC and NDHWC all to data_format "NHWC"
+// (`'NCHW' if data_format[1] == 'C' else 'NHWC'`). So an "NHWC" batch_norm may
+// be rank 3 (BatchNorm1D) or rank 5 (BatchNorm3D), and a fixed {0, 3, 1, 2}
+// would be a malformed Transpose on both. The permutation moves the last axis
+// to position 1 whatever the rank.
+inline std::vector<int64_t> ChannelsLastToFirstPerm(size_t rank) {
+  std::vector<int64_t> perm = {0, static_cast<int64_t>(rank) - 1};
+  for (int64_t i = 1; i < static_cast<int64_t>(rank) - 1; ++i) {
+    perm.push_back(i);
+  }
+  return perm;
+}
+inline std::vector<int64_t> ChannelsFirstToLastPerm(size_t rank) {
+  std::vector<int64_t> perm = {0};
+  for (int64_t i = 2; i < static_cast<int64_t>(rank); ++i) {
+    perm.push_back(i);
+  }
+  perm.push_back(1);
+  return perm;
+}
+}  // namespace
+
 void BatchNormMapper::Opset7() {
   auto input_info = GetInput("X");
   auto mean_info = GetInput("Mean");
@@ -44,10 +68,13 @@ void BatchNormMapper::Opset7() {
   //   unification between 64 and 112
   // -- 64 channels against a 112 spatial extent. Unlike conv2d and pool2d this
   // one never refused, because it did not know there was anything to refuse.
-  const bool nhwc = data_format_ == "NHWC";
+  const bool nhwc =
+      data_format_ == "NHWC" && input_info[0].shape.size() >= 3;
   std::string nhwc_final_output;
+  const size_t rank = input_info[0].shape.size();
   if (nhwc) {
-    input_info[0].name = helper_->Transpose(input_info[0].name, {0, 3, 1, 2});
+    input_info[0].name = helper_->Transpose(
+        input_info[0].name, ChannelsLastToFirstPerm(rank));
     nhwc_final_output = output_info[0].name;
     output_info[0].name = MapperHelper::Get()->GenName("batch_norm.nchw");
   }
@@ -90,7 +117,7 @@ void BatchNormMapper::Opset7() {
 
   if (nhwc) {
     helper_->Transpose(
-        output_info[0].name, nhwc_final_output, {0, 2, 3, 1});
+        output_info[0].name, nhwc_final_output, ChannelsFirstToLastPerm(rank));
   }
 }
 
@@ -101,10 +128,13 @@ void BatchNormMapper::Opset14() {
   auto output_info = GetOutput("Y");
 
   // Same transpose-around as Opset7 above; see the comment there.
-  const bool nhwc = data_format_ == "NHWC";
+  const bool nhwc =
+      data_format_ == "NHWC" && input_info[0].shape.size() >= 3;
   std::string nhwc_final_output;
+  const size_t rank = input_info[0].shape.size();
   if (nhwc) {
-    input_info[0].name = helper_->Transpose(input_info[0].name, {0, 3, 1, 2});
+    input_info[0].name = helper_->Transpose(
+        input_info[0].name, ChannelsLastToFirstPerm(rank));
     nhwc_final_output = output_info[0].name;
     output_info[0].name = MapperHelper::Get()->GenName("batch_norm.nchw");
   }
@@ -157,7 +187,7 @@ void BatchNormMapper::Opset14() {
 
   if (nhwc) {
     helper_->Transpose(
-        output_info[0].name, nhwc_final_output, {0, 2, 3, 1});
+        output_info[0].name, nhwc_final_output, ChannelsFirstToLastPerm(rank));
   }
 }
 

@@ -152,9 +152,15 @@ void IndexPutMapper::Opset11() {
     // indices.shape[:-1] + data.shape[num_dims:]
     // where num_dims = indices.shape[-1] = number of index tensors
 
-    // Get indices shape (without the last dim we added via Unsqueeze)
-    auto indices_shape_node =
-        helper_->MakeNode("Shape", {indices_info[0].name});
+    // Get indices shape (without the last dim we added via Unsqueeze). It is
+    // read from the *aligned* operand: after broadcasting, indices_info[0] may
+    // still be [?,1,1] while the region indexed is [?,?,1], and an updates
+    // tensor expanded to the former is refused by ScatterND whenever value
+    // does not already carry the broadcast dims itself. A single index has
+    // nothing to broadcast against and keeps the edge it always had.
+    auto indices_shape_node = helper_->MakeNode(
+        "Shape",
+        {indices_info.size() > 1 ? aligned_names[0] : indices_info[0].name});
 
     // Get data shape and slice from num_dims onwards
     auto data_shape_node = helper_->MakeNode("Shape", {x_info[0].name});
