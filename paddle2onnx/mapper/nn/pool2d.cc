@@ -14,6 +14,8 @@
 
 #include "paddle2onnx/mapper/nn/pool2d.h"
 
+#include "paddle2onnx/mapper/nn/pool_exact.h"
+
 #include <algorithm>
 #include <cmath>
 #include <string>
@@ -190,6 +192,40 @@ void Pool2dMapper::NoAdaptivePool(const std::vector<TensorInfo>& input_info,
     k_size_[1] = input_shape[3] + pads_[1] + pads_[3];
   }
 
+  const bool is_max =
+      convert_pir_op_name(OpType()) == "max_pool2d_with_index" ||
+      pooling_type_ == "max";
+  // exclusive_ holds ONNX's count_include_pad (inverted at parse); Paddle's
+  // own attribute is its negation.
+  const bool paddle_exclusive = !exclusive_;
+  if (padding_algorithm_ != "SAME" && padding_algorithm_ != "VALID") {
+    // Where ONNX's pool attributes cannot say what Paddle computes, and the
+    // extents are static, emit it exactly -- see pool_exact.h. Configurations
+    // the plain emission already gets right never take this path.
+    std::vector<pool_exact::Axis> axes = {
+        {input_shape[2], k_size_[0], strides_[0], pads_[0], pads_[2]},
+        {input_shape[3], k_size_[1], strides_[1], pads_[1], pads_[3]}};
+    if (pool_exact::NeedsExact(axes, ceil_mode_, !is_max, paddle_exclusive)) {
+      std::string x = input_info[0].name;
+      bool needs_cast = kNoNeedCastTypesOpSet7.find(input_info[0].dtype) ==
+                        kNoNeedCastTypesOpSet7.end();
+      if (needs_cast) {
+        x = helper_->AutoCast(x, input_info[0].dtype, P2ODataType::FP32);
+      }
+      std::string y = pool_exact::EmitExactPool(
+          helper_, x, axes, ceil_mode_, is_max, paddle_exclusive);
+      if (!y.empty()) {
+        if (needs_cast) {
+          helper_->AutoCast(y, output_info[0].name, P2ODataType::FP32,
+                            output_info[0].dtype);
+        } else {
+          helper_->MakeNode("Identity", {y}, {output_info[0].name});
+        }
+        return;
+      }
+    }
+  }
+
   int64_t max_ksize = *std::max_element(std::begin(k_size_), std::end(k_size_));
   int64_t max_pads = *std::max_element(std::begin(pads_), std::end(pads_));
   std::string input_x = input_info[0].name;
@@ -206,7 +242,11 @@ void Pool2dMapper::NoAdaptivePool(const std::vector<TensorInfo>& input_info,
       std::string paddings_node =
           helper_->Constant(GetOnnxDtype(P2ODataType::INT64), onnx_paddings);
       inputs_names.push_back(paddings_node);
-      std::vector<float> val = {0.0};
+      // 0 is the wrong value for a max pool (an all-negative window would
+      // return 0), and a zero Pad is what onnxruntime fuses back into the
+      // pool's pads and then refuses. Paddle's empty max window is -FLT_MAX.
+      std::vector<float> val = {
+          is_max ? std::numeric_limits<float>::lowest() : 0.0f};
       std::string val_node =
           helper_->Constant(GetOnnxDtype(P2ODataType::FP32), val);
       inputs_names.push_back(val_node);
@@ -216,7 +256,7 @@ void Pool2dMapper::NoAdaptivePool(const std::vector<TensorInfo>& input_info,
     AddAttribute(node, "mode", mode);
     if (helper_->GetOpsetVersion() < 11) {
       AddAttribute(node, "pads", onnx_paddings);
-      float val = 0.0;
+      float val = is_max ? std::numeric_limits<float>::lowest() : 0.0f;
       AddAttribute(node, "value", val);
     }
     input_x = node->output(0);
@@ -339,19 +379,10 @@ int32_t Pool2dMapper::GetMinOpsetVersion(bool verbose) {
     // division, which both truncated the ratio to a constant (so every window
     // looked identical) and said nothing about strides — 30 -> 4 passed it
     // and converted to a pool that averages different pixels than Paddle's.
-    // Non-divisible average pooling is emitted exactly instead (see
-    // ExactAdaptiveAvgPool); max pooling is not linear and has no such form,
-    // so it is refused rather than approximated.
-    bool divisible = (input_h % output_h == 0) && (input_w % output_w == 0);
-    bool is_average = convert_pir_op_name(OpType()) != "max_pool2d_with_index" &&
-                      pooling_type_ == "avg";
-    if (!divisible && !is_average) {
-      Error() << "Adaptive max pool whose output does not evenly divide its "
-                 "input cannot be expressed as an ONNX MaxPool. input_size: "
-              << input_h << " " << input_w << " output_size: " << output_h
-              << " " << output_w << std::endl;
-      return -1;
-    }
+    // Non-divisible pooling is emitted exactly instead, in Opset7: average as
+    // two averaging matrix products (ExactAdaptiveAvgPool), max -- which is
+    // not linear but is separable over a box -- window by window
+    // (pool_exact::EmitAdaptiveBySlices).
   }
   if (convert_pir_op_name(OpType()) == "max_pool2d_with_index") {
     return 9;
@@ -441,9 +472,24 @@ void Pool2dMapper::Opset7() {
     int64_t output_w = output_info[0].shape[3];
     if (input_h % output_h == 0 && input_w % output_w == 0) {
       AdaptivePool(input_info, output_info);
-    } else {
-      // GetMinOpsetVersion only lets average pooling through here.
+    } else if (convert_pir_op_name(OpType()) != "max_pool2d_with_index" &&
+               pooling_type_ == "avg") {
       ExactAdaptiveAvgPool(input_info, output_info);
+    } else {
+      std::string x = input_info[0].name;
+      bool needs_cast = kNoNeedCastTypesOpSet7.find(input_info[0].dtype) ==
+                        kNoNeedCastTypesOpSet7.end();
+      if (needs_cast) {
+        x = helper_->AutoCast(x, input_info[0].dtype, P2ODataType::FP32);
+      }
+      std::string y = pool_exact::EmitAdaptiveBySlices(
+          helper_, x, {input_h, input_w}, {output_h, output_w}, true);
+      if (needs_cast) {
+        helper_->AutoCast(y, output_info[0].name, P2ODataType::FP32,
+                          output_info[0].dtype);
+      } else {
+        helper_->MakeNode("Identity", {y}, {output_info[0].name});
+      }
     }
   } else {
     NoAdaptivePool(input_info, output_info);

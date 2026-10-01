@@ -14,6 +14,8 @@
 
 #include "paddle2onnx/mapper/nn/pool3d.h"
 
+#include "paddle2onnx/mapper/nn/pool_exact.h"
+
 #include <algorithm>
 #include <cmath>
 #include <string>
@@ -32,7 +34,8 @@ bool Pool3dMapper::IsSameSpan(const int64_t& in_size, const int64_t& out_size) {
   // truncated the ratio to a constant and said nothing about strides — a
   // non-divisible pool passed it and converted to one that averages different
   // elements than Paddle's (see the 2-D mapper, where the average case is now
-  // emitted exactly; 3-D keeps the refusal).
+  // emitted exactly). A non-divisible 3-D pool is emitted window by window
+  // instead -- see Opset7.
   return in_size % out_size == 0;
 }
 
@@ -118,6 +121,38 @@ void Pool3dMapper::NoAdaptivePool(const std::vector<TensorInfo>& input_info,
     k_size_[2] = input_shape[4] + pads_[2];
   }
 
+  const bool is_max =
+      convert_pir_op_name(OpType()) == "max_pool3d_with_index" ||
+      pooling_type_ == "max";
+  // exclusive_ holds ONNX's count_include_pad (inverted at parse).
+  const bool paddle_exclusive = !exclusive_;
+  if (padding_algorithm_ != "SAME" && padding_algorithm_ != "VALID") {
+    // Same exact emission as the 2-D mapper -- see pool_exact.h.
+    std::vector<pool_exact::Axis> axes = {
+        {input_shape[2], k_size_[0], strides_[0], pads_[0], pads_[3]},
+        {input_shape[3], k_size_[1], strides_[1], pads_[1], pads_[4]},
+        {input_shape[4], k_size_[2], strides_[2], pads_[2], pads_[5]}};
+    if (pool_exact::NeedsExact(axes, ceil_mode_, !is_max, paddle_exclusive)) {
+      std::string x = input_info[0].name;
+      bool needs_cast = kNoNeedCastTypesOpSet7.find(input_info[0].dtype) ==
+                        kNoNeedCastTypesOpSet7.end();
+      if (needs_cast) {
+        x = helper_->AutoCast(x, input_info[0].dtype, P2ODataType::FP32);
+      }
+      std::string y = pool_exact::EmitExactPool(
+          helper_, x, axes, ceil_mode_, is_max, paddle_exclusive);
+      if (!y.empty()) {
+        if (needs_cast) {
+          helper_->AutoCast(y, output_info[0].name, P2ODataType::FP32,
+                            output_info[0].dtype);
+        } else {
+          helper_->MakeNode("Identity", {y}, {output_info[0].name});
+        }
+        return;
+      }
+    }
+  }
+
   int64_t max_ksize = *std::max_element(std::begin(k_size_), std::end(k_size_));
   int64_t max_pads = *std::max_element(std::begin(pads_), std::end(pads_));
   auto input_x = input_info[0].name;
@@ -135,7 +170,9 @@ void Pool3dMapper::NoAdaptivePool(const std::vector<TensorInfo>& input_info,
       std::string paddings_node =
           helper_->Constant(GetOnnxDtype(P2ODataType::INT64), onnx_paddings);
       inputs_names.push_back(paddings_node);
-      std::vector<float> val = {0.0};
+      // Lowest float for max, as in the 2-D mapper.
+      std::vector<float> val = {
+          is_max ? std::numeric_limits<float>::lowest() : 0.0f};
       std::string val_node =
           helper_->Constant(GetOnnxDtype(P2ODataType::FP32), val);
       inputs_names.push_back(val_node);
@@ -145,7 +182,7 @@ void Pool3dMapper::NoAdaptivePool(const std::vector<TensorInfo>& input_info,
     AddAttribute(node, "mode", mode);
     if (helper_->GetOpsetVersion() < 11) {
       AddAttribute(node, "pads", onnx_paddings);
-      float val = 0.0;
+      float val = is_max ? std::numeric_limits<float>::lowest() : 0.0f;
       AddAttribute(node, "value", val);
     }
     input_x = node->output(0);
@@ -225,14 +262,14 @@ int32_t Pool3dMapper::GetMinOpsetVersion(bool verbose) {
     int64_t output_d = output_info[0].shape[2];
     int64_t output_h = output_info[0].shape[3];
     int64_t output_w = output_info[0].shape[4];
-    if (!IsSameSpan(input_h, output_h) || !IsSameSpan(input_w, output_w) ||
-        !IsSameSpan(input_d, output_d)) {
+    if (output_d <= 0 || output_h <= 0 || output_w <= 0) {
       Error() << "Cannot convert adaptive pool with input_size: " << input_d
               << " " << input_h << " " << input_w
               << " output_size: " << output_d << " " << output_h << " "
               << output_w << std::endl;
       return -1;
     }
+    // Non-divisible extents are emitted window by window in Opset7.
   }
   if (convert_pir_op_name(OpType()) == "max_pool3d_with_index") {
     return 9;
@@ -284,7 +321,36 @@ void Pool3dMapper::Opset7() {
           output, output_info[0].name, P2ODataType::FP32, output_info[0].dtype);
     }
   } else if (adaptive_) {
-    AdaptivePool(input_info, output_info);
+    const std::vector<int64_t> in = {input_info[0].shape[2],
+                                     input_info[0].shape[3],
+                                     input_info[0].shape[4]};
+    const std::vector<int64_t> out = {output_info[0].shape[2],
+                                      output_info[0].shape[3],
+                                      output_info[0].shape[4]};
+    if (IsSameSpan(in[0], out[0]) && IsSameSpan(in[1], out[1]) &&
+        IsSameSpan(in[2], out[2])) {
+      AdaptivePool(input_info, output_info);
+    } else {
+      // Paddle's windows overlap with non-uniform strides here, which no
+      // MaxPool/AveragePool(kernel, stride) samples: emit them exactly.
+      const bool is_max =
+          convert_pir_op_name(OpType()) == "max_pool3d_with_index" ||
+          pooling_type_ == "max";
+      std::string x = input_info[0].name;
+      bool needs_cast = kNoNeedCastTypesOpSet7.find(input_info[0].dtype) ==
+                        kNoNeedCastTypesOpSet7.end();
+      if (needs_cast) {
+        x = helper_->AutoCast(x, input_info[0].dtype, P2ODataType::FP32);
+      }
+      std::string y =
+          pool_exact::EmitAdaptiveBySlices(helper_, x, in, out, is_max);
+      if (needs_cast) {
+        helper_->AutoCast(y, output_info[0].name, P2ODataType::FP32,
+                          output_info[0].dtype);
+      } else {
+        helper_->MakeNode("Identity", {y}, {output_info[0].name});
+      }
+    }
   } else {
     NoAdaptivePool(input_info, output_info);
   }
